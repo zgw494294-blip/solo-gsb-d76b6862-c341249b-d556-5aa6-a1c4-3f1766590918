@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 .git/
 .pytest_cache/
+sessions.db*

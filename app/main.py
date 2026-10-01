@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from . import sessions
@@ -17,9 +19,19 @@ from .schemas import (
     SessionView,
 )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create the session database (directory, file, schema) before serving;
+    # every worker process runs this, and the schema creation is idempotent.
+    sessions.init_storage()
+    yield
+
+
 app = FastAPI(
     title="Offline Two-Party Message Protocol Deadlock Analyzer",
     version="1.3.0",
+    lifespan=lifespan,
 )
 
 
@@ -55,25 +67,23 @@ def analyze_completion_guarantee(request: GuaranteeRequest) -> dict:
 
 @app.post("/v1/sessions", response_model=SessionView, status_code=201)
 def create_session(request: SessionCreateRequest) -> dict:
-    session_id, session = sessions.create_session(request)
-    return sessions.session_view(session_id, session)
+    return sessions.create_session(request)
 
 
 @app.get("/v1/sessions/{session_id}", response_model=SessionView)
 def read_session(session_id: str) -> dict:
-    session = sessions.get_session(session_id)
-    return sessions.session_view(session_id, session)
+    return sessions.get_session_view(session_id)
 
 
 @app.post("/v1/sessions/{session_id}/transitions", response_model=SessionView)
 def execute_session_transition(session_id: str, request: ExecutionRequest) -> dict:
-    session = sessions.get_session(session_id)
-    sessions.execute_transition(session, request.transition_id, request.expected_version)
-    return sessions.session_view(session_id, session)
+    return sessions.execute_transition(
+        session_id, request.transition_id, request.expected_version
+    )
 
 
 @app.put("/v1/sessions/{session_id}/protocol", response_model=SessionView)
 def replace_session_protocol(session_id: str, request: ProtocolReplaceRequest) -> dict:
-    session = sessions.get_session(session_id)
-    sessions.replace_protocol(session, request.protocol, request.expected_version)
-    return sessions.session_view(session_id, session)
+    return sessions.replace_protocol(
+        session_id, request.protocol, request.expected_version
+    )
