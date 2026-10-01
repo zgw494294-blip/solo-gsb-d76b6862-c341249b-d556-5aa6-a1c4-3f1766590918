@@ -1,5 +1,13 @@
 """End-to-end checks for the stateful session drill feature."""
 
+import os
+import tempfile
+
+# Each test run uses an isolated SQLite file; must be set before the app
+# (and app.sessions) is imported.
+_db_dir = tempfile.mkdtemp(prefix="drill-sessions-")
+os.environ["SESSION_DB_PATH"] = os.path.join(_db_dir, "sessions.db")
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -288,6 +296,80 @@ r = client.post("/v1/deactivation-plans", json={**P, "removable_transition_ids":
 check("deactivation-plans endpoint intact", r.status_code == 200)
 r = client.post("/v1/completion-guarantees", json=P)
 check("completion-guarantees endpoint intact", r.status_code == 200)
+
+# 17. persistence across processes: a separate process opens the same SQLite
+#     file, finds the session by its original id, and continues the drill.
+r = client.post("/v1/sessions", json=P)
+check("persist: create 201", r.status_code == 201, r.status_code)
+psid = r.json()["id"]
+r = client.post(f"/v1/sessions/{psid}/transitions",
+                json={"transition_id": "t1", "expected_version": 0})
+check("persist: t1 200", r.status_code == 200, r.status_code)
+
+import json as _json
+import subprocess
+import sys as _sys
+
+probe = _json.dumps({
+    "db_path": os.environ["SESSION_DB_PATH"],
+    "sid": psid,
+    "protocol": P,
+})
+code = """
+import json, os, sys
+payload = json.loads(sys.argv[1])
+os.environ["SESSION_DB_PATH"] = payload["db_path"]
+from app.sessions import view_session, execute_transition, replace_protocol
+
+view = view_session(payload["sid"])
+assert view["version"] == 1, view["version"]
+assert [step["transition_id"] for step in view["trace"]] == ["t1"], view["trace"]
+
+# Stale version across processes -> 409 carrying the current version.
+try:
+    execute_transition(payload["sid"], "t4", 0)
+except Exception as exc:
+    assert exc.status_code == 409, (exc.status_code, getattr(exc, "detail", None))
+    assert exc.detail == {"error": "version_conflict", "current_version": 1}, exc.detail
+else:
+    raise AssertionError("stale cross-process execute did not conflict")
+
+# Up-to-date version -> commits in the other process.
+view = execute_transition(payload["sid"], "t4", 1)
+assert view["version"] == 2, view["version"]
+assert view["configuration"]["state"] == {"A": 1, "B": 1}, view["configuration"]
+
+# Protocol replacement also persists and survives a second process read.
+from app.schemas import DeadlockRequest
+p2 = DeadlockRequest.model_validate(payload["protocol"])
+replace_protocol(payload["sid"], p2, 2)
+view = view_session(payload["sid"])
+assert view["version"] == 3, view["version"]
+print("PROBE-OK")
+"""
+proc = subprocess.run(
+    [_sys.executable, "-c", code, probe],
+    capture_output=True,
+    text=True,
+)
+check("cross-process probe ok", proc.returncode == 0 and "PROBE-OK" in proc.stdout,
+      (proc.returncode, proc.stdout, proc.stderr))
+
+# The committing process sees the other process's committed revision; versions
+# never regress and the stale version 0 still conflicts after "restart".
+b = client.get(f"/v1/sessions/{psid}").json()
+check("persist: version visible after other process committed", b["version"] == 3, b)
+r = client.post(f"/v1/sessions/{psid}/transitions",
+                json={"transition_id": "t1", "expected_version": 0})
+check("persist: old version still 409", r.status_code == 409, r.status_code)
+check("persist: conflict reports current version",
+      r.json().get("detail", {}).get("current_version") == 3, r.json())
+
+# Simulate a process restart: re-initializing the DB must not wipe data.
+import app.sessions as sessions_mod
+sessions_mod.init_db()
+b = client.get(f"/v1/sessions/{psid}").json()
+check("re-init keeps sessions", b["version"] == 3 and len(b["trace"]) == 2, b)
 
 print()
 if failures:

@@ -1,6 +1,6 @@
 # 离线双端消息协议分析 API
 
-基于 Python + FastAPI，对 A、B 两端的 send/receive 状态机做离线可达性分析，包括死锁检测、完成保证、完成计划与最小停用方案。服务完全离线运行，不依赖数据库或外部服务。
+基于 Python + FastAPI，对 A、B 两端的 send/receive 状态机做离线可达性分析，包括死锁检测、完成保证、完成计划与最小停用方案。服务完全离线运行，不依赖任何外部服务；演练会话使用本地 SQLite 文件持久化，默认随容器以两个 Uvicorn worker 启动。
 
 ## 协议模型
 
@@ -29,7 +29,14 @@
 docker compose up --build -d
 ```
 
-该命令会构建镜像并在后台启动服务。服务监听 **8000 端口**。
+该命令会构建镜像并在后台启动服务。服务监听 **8000 端口**，容器内默认启动**两个 Uvicorn worker**，二者通过同一个本地 SQLite 文件（`/data/sessions.db`，WAL 模式）共享演练会话，数据库与表在首次启动时自动创建，运行用户对该目录可写。
+
+Compose 把命名卷 `sessions-data` 挂载到容器 `/data`，会话数据的保留规则：
+
+- `docker compose restart`、`docker compose stop` 后再 `start`、镜像重新构建（`up --build`）或容器被删除后重新 `up`：命名卷保留，会话与版本不丢失，可按原 ID 继续；
+- `docker compose down`：只删除容器，**命名卷保留**，下次 `up` 仍可查询旧会话；
+- `docker compose down -v`（或 `docker volume rm`、`docker volume prune`）会删除命名卷，其中的会话随之永久删除；
+- 不使用 Compose 而直接 `docker run` 且未挂载卷/主机目录到 `/data` 时，数据位于容器可写层，容器删除即丢失。
 
 查看日志：
 
@@ -576,10 +583,11 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练。
 
-- 会话只保存在**单进程内存**中，进程重启即清空，不使用数据库或外部存储。
-- 每次成功执行转移或替换协议，会话 `version` 加 1（创建时为 `0`）。
-- 修改类请求必须携带 `expected_version`：与当前版本不一致返回 `409`；同一版本的并发修改在会话锁保护下只有一项成功，其余返回 `409`。
-- 协议、当前配置、轨迹与版本的更新在同一个锁内一次完成；任何失败都保持旧会话不变，随后查询仍返回同一版本快照。
+- 会话持久化保存在容器内**本地 SQLite 文件** `/data/sessions.db`（WAL 模式），Compose 通过命名卷 `sessions-data` 挂载该路径；服务或容器重启、镜像重建后会话仍在，可按原 ID 查询、继续执行或替换协议。两个 Uvicorn worker 共享同一个数据库文件。无需迁移旧版本内存中的会话。
+- 每次成功执行转移或替换协议，会话 `version` 加 1（创建时为 `0`），版本随数据库持久化，重启后不回退。
+- 修改类请求必须携带 `expected_version`：与当前版本不一致返回 `409`（响应体 `detail.current_version` 给出当前版本）；两个进程以同一 `expected_version` 并发修改同一会话时，SQLite 立即写事务将其串行化，**只有一项成功**，其余返回 `409`。
+- 版本检查、轨迹重放与行更新在同一个已提交状态上、同一写事务内完成；任何失败（含重放失败）都回滚，旧会话不变，随后查询仍返回旧版本完整快照。
+- 查询是单条只读 `SELECT`，只能读到完整的已提交版本；成功响应由本次提交的协议、轨迹与版本直接构造，不会混入随后其他请求提交的数据。
 
 ### 接口
 
@@ -678,13 +686,98 @@ curl -s -X PUT http://localhost:8000/v1/sessions/$SID/protocol \
 
 此时会话保持旧协议与版本 `3` 不变。用过期版本（如 `"expected_version": 2`）替换返回 `409`；查询不存在的会话 ID 返回 `404`。
 
+### 跨进程并发修改（两个 worker，同版本只有一项成功）
+
+两个 worker 共享同一个 SQLite 文件。下例对同一会话、同一 `expected_version: 0` 并发发起两个执行请求：无论请求落在哪个 worker，都恰好一个返回 `200`，另一个返回 `409` 并带回当前版本。
+
+```bash
+# 新建会话并记录 ID
+SID=$(curl -s -X POST http://localhost:8000/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "transitions": [
+      { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+      { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+    ]
+  }' | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+
+# 两个并发请求使用完全相同的 expected_version
+curl -s -o /tmp/a.json -w "A: %{http_code}\n" -X POST \
+  http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t1", "expected_version": 0}' &
+curl -s -o /tmp/b.json -w "B: %{http_code}\n" -X POST \
+  http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t1", "expected_version": 0}' &
+wait
+
+# 一个输出 "A: 200"/"B: 200"，另一个为 409；
+# 409 的响应体为：
+#   {"detail":{"error":"version_conflict","current_version":1}}
+# 成功方响应中的 version=1、trace 恰为一步，不包含随后提交。
+cat /tmp/a.json /tmp/b.json
+```
+
+替换协议接口的行为相同：对同一会话以相同 `expected_version` 并发 `PUT /v1/sessions/$SID/protocol`，同样恰好一个 `200`、其余 `409`。拿到 `409` 后先 `GET` 取得新版本（及最新协议/轨迹），再按新版本重试即可。
+
+### 重启 / 重建后续演（按原 ID 查询、执行与替换协议）
+
+命名卷在服务重启和镜像重建后仍然保留，因此可直接复用之前的会话 ID：
+
+```bash
+# 重建并重启容器（-v 会删除卷，切勿使用）
+docker compose up --build -d
+
+# 按原 ID 查询：仍为重启前的版本与完整轨迹
+curl -s http://localhost:8000/v1/sessions/$SID
+
+# 用重启前返回的版本继续执行（上例中执行 t1 成功后版本为 1）
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t4", "expected_version": 1}'
+# 200，version 变为 2，轨迹为 t1, t4
+
+# 重启不会让版本回退：旧版本请求仍然冲突
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t1", "expected_version": 0}'
+# 409 {"detail":{"error":"version_conflict","current_version":2}}
+
+# 重启后同样可以替换协议，已执行轨迹按新协议重放
+curl -s -X PUT http://localhost:8000/v1/sessions/$SID/protocol \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_version": 2,
+    "protocol": {
+      "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+      "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+      "transitions": [
+        { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 0 },
+        { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+      ]
+    }
+  }'
+# 200，version 变为 3，轨迹仍为两步但按新定义重算
+```
+
 ## 本地开发（不使用 Docker）
+
+默认数据库路径是容器内的 `/data/sessions.db`；本地开发请用环境变量 `SESSION_DB_PATH` 指向可写路径：
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+SESSION_DB_PATH=./data/sessions.db uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+数据库（及 WAL 附属文件）在首次启动时自动创建，目录不存在会自动创建。`--reload` 开发模式为单进程；需要本地复现双 worker 行为时可运行：
+
+```bash
+SESSION_DB_PATH=./data/sessions.db uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
 ## 项目结构
